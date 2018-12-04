@@ -24,19 +24,29 @@ Examples:
 
 Convert font in Luna.ttf to 14 point size bitmap font for 140 DPI display:
 
-ttf2ugui --font Luna.ttf --dpi 140 --size 14 --dump
+Generate font data for only printable latin characters:
+```
+   ttf2ugui --font Luna.ttf --dpi 140 --size 14 --dump
+```
+
+
+If you want to generate font data only for specified codes, just put all your codes in file named 'codes_file' and use
+
+```
+   ttf2ugui --font Luna.ttf --dpi 140 --size 14 --codesFile codes_file --dump
+```
 
 Results are in Luna.c and Luna.h, just compile the
 .c and include .h in your uGUI application.
 
 Show ascii art of same font:
-
-ttf2ugui --font Luna.ttf --dpi 140 --size 14 --show "aString"
-
+```
+   ttf2ugui --font Luna.ttf --dpi 140 --size 14 --show "aString"
+```
 If you want to generate 8BPP fonts ( so you get anti alliased fonts ) use
-
-ttf2ugui --font Luna.ttf --dpi 140 --size 14 --show "aString" --bpp=8
-
+```
+   ttf2ugui --font Luna.ttf --dpi 140 --size 14 --show "aString" --bpp=8
+```
 Compiling
 ---------
 

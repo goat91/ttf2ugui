@@ -47,8 +47,14 @@ static UG_GUI gui;
 static float fontSize = 0;
 static int dpi = 0;
 static int bpp = 1;
+
 static int minChar = 32;
 static int maxChar = 126;
+
+static UG_Unicode *codes;
+
+static uint32_t codes_count = 0;
+static char *codesFile;
 
 /*
  * "draw" a pixel using ansi escape sequences.
@@ -85,6 +91,89 @@ static int max(int a, int b)
   return b;
 }
 
+
+static UG_U32 unicode_to_utf8(const UG_Unicode *uni_str, UG_U32 uni_len, UG_U8 **utf8_str)
+{
+  UG_U32 i, j;
+  UG_U8 *str = calloc(sizeof(UG_U8), uni_len * 4 + 1);
+
+  for (i = 0, j = 0; i < uni_len; i++) {
+    if (uni_str[i] <= 0x007f) {
+      str[j] = uni_str[i] & 0x7f;
+      j++;
+    } else if (uni_str[i] >= 0x0080 && uni_str[i] <= 0x07ff) {
+      str[j] = ((UG_U8)(uni_str[i] >> 6) | 0x6 << 5);
+      str[j+1] = ((UG_U8)(uni_str[i] & 0x3f) | 0x2 << 6);
+      j += 2;
+    } else if (uni_str[i] >= 0x0800 && uni_str[i] <= 0xffff) {
+      str[j] = ((UG_U8)(uni_str[i] >> 12) | (0xe << 4));
+      str[j+1] = ((UG_U8)((uni_str[i] & 0xfff) >> 6) | (0x2 << 6));
+      str[j+2] = ((UG_U8)(uni_str[i] & 0x3f) | (0x2 << 6));
+      j += 3;
+    } else if (uni_str[i] >= 0x10000 && uni_str[i] <= 0x10ffff) {
+      str[j] = ((UG_U8)(uni_str[i] >> 18) | 0x1e << 3);
+      str[j+1] = ((UG_U8)((uni_str[i] & 0x3ffff) >> 12) | 0x2 << 6);
+      str[j+2] = ((UG_U8)((uni_str[i] & 0xfff) >> 6) | 0x2 << 6);
+      str[j+3] = ((UG_U8)(uni_str[i] & 0x3f) | 0x2 << 6);
+      j += 4;
+    } else
+      continue;
+  }
+  str[j] = 0;
+
+  *utf8_str = str;
+  return j;
+}
+
+
+static UG_U32 utf8_to_unicode(const UG_U8 *str, UG_U32 str_len, UG_Unicode **uni_str)
+{
+  UG_U32 i, j;
+  UG_Unicode code = 0;
+  UG_Unicode *buf;
+
+  for (i = 0, j = 0; i < str_len; j++) {
+    if (str[i] < 0x80)
+      i++;
+    else if (str[i] >= 0xc0 && str[i] <= 0xdf)
+      i+=2;
+    else if (str[i] >= 0xe0 && str[i] <= 0xef)
+      i+=3;
+    else if (str[i] >= 0xf0 && str[i] <= 0xf7)
+      i+=4;
+    else
+      return 0;
+  }
+
+  printf("count is %u\n", j);
+  buf = calloc(sizeof(UG_Unicode), j+1);
+  for (i = 0, j = 0; i < str_len; j++) {
+    if (str[i] < 0x80) {
+      code = (UG_Unicode)str[i];
+      i++;
+    }
+    else if (str[i] >= 0xc0 && str[i] <= 0xdf) {
+      code = (str[i] & 0x1f) << 6 | (str[i+1] & 0x3f);
+      i+=2;
+    } else if (str[i] >= 0xe0 && str[i] <= 0xef) {
+      code = ((str[i] & 0xf) << 12) | ((str[i+1] & 0x3f) << 6) | (str[i+2] & 0x3f);
+      i+=3;
+    } else if (str[i] >= 0xf0 && str[i] <= 0xf7) {
+      code = ((str[i] & 0x7) << 18) | ((str[i+1] & 0x3f) << 12) | ((str[i+2] & 0x3f) << 6) | (str[i+3] & 0x3f);
+      i+=4;
+    } else {
+      free(buf);
+      return 0;
+    }
+    printf("code is 0x%08x\n", code);
+    buf[j] = code;
+  }
+
+  buf[j] = 0;
+  *uni_str = buf;
+  return j;
+}
+
 /*
  * Output C-language code that can be used to include
  * converted font into uGUI application.
@@ -92,7 +181,7 @@ static int max(int a, int b)
 static void dumpFont(const UG_FONT * font, const char* fontFile, float fontSize,int bitsPerPixel)
 {
   int bytesPerChar;
-  int ch;
+  UG_Unicode ch;
   int current;
   int b;
   char fontName[80];
@@ -158,11 +247,14 @@ static void dumpFont(const UG_FONT * font, const char* fontFile, float fontSize,
   fprintf(out, "// For copyright, see original font file.\n");
   fprintf(out, "\n#include \"ugui.h\"\n\n");
 
-  fprintf(out, "static __UG_FONT_DATA unsigned char fontBits_%s[%d][%d] = {\n", fontName, font->end_char - font->start_char + 1, bytesPerChar);
+  fprintf(out, "static __UG_FONT_DATA unsigned char fontBits_%s[%d][%d] = {\n", fontName, font->codes_count, bytesPerChar);
 
   current = 0;
-  for (ch = font->start_char; ch <= font->end_char; ch++) {
+  int i = 0;
+  UG_U8 *str;
 
+  for (i = 0; i < font->codes_count; i++) {
+    ch = font->codes[i];
     fprintf(out, "  {");
     for (b = 0; b < bytesPerChar; b++) {
 
@@ -174,12 +266,15 @@ static void dumpFont(const UG_FONT * font, const char* fontFile, float fontSize,
     }
 
     fprintf(out, " }");
-    if (ch <= font->end_char - 1)
+    if (i < font->codes_count - 1)
       fprintf(out, ",");
     else
       fprintf(out, " ");
 
-    fprintf(out, " // 0x%X '%c'\n", ch, ch);
+    if (unicode_to_utf8(&ch, 1, &str) > 0) {
+      fprintf(out, " // 0x%X '%s'\n", ch, (char*)str);
+      free(str);
+    }
   }
 
   fprintf(out, "};\n");
@@ -189,20 +284,47 @@ static void dumpFont(const UG_FONT * font, const char* fontFile, float fontSize,
  */
   fprintf(out, "static const UG_U8 fontWidths_%s[] = {\n", fontName);
 
-  for (ch = font->start_char; ch <= font->end_char; ch++) {
-
-    if (ch != font->start_char)
+  for (i = 0; i < font->codes_count; i++) {
+    ch = font->codes[i];
+    if (i != 0)
       fprintf(out, ",");
 
-    fprintf(out, "%d", font->widths[ch - font->start_char]);
+    fprintf(out, "%d", font->widths[i]);
   }
 
   fprintf(out, "};\n");
 
+  if (codesFile) {
+    fprintf(out, "static const UG_Unicode fontCodes_%s[] = {\n", fontName);
+
+    for (i = 0; i < font->codes_count; i++) {
+      ch = font->codes[i];
+      if (i != 0)
+        fprintf(out, ",");
+
+      fprintf(out, "0x%08x", font->codes[i]);
+    }
+
+    fprintf(out, "};\n");
+  }
+
 /*
  * Last, output UG_FONT structure.
  */
-  fprintf(out, "const UG_FONT font_%s = { (unsigned char*)fontBits_%s, FONT_TYPE_%dBPP, %d, %d, %d, %d, fontWidths_%s };\n",
+  if (codesFile) {
+    fprintf(out, "const UG_FONT font_%s = { (unsigned char*)fontBits_%s, FONT_TYPE_%dBPP, %d, %d, %d, %d, fontWidths_%s, fontCodes_%s, %u };\n",
+          fontName,
+          fontName,
+          bitsPerPixel,
+          font->char_width,
+          font->char_height,
+          font->start_char,
+          font->end_char,
+          fontName,
+          fontName,
+	  font->codes_count);
+   } else
+    fprintf(out, "const UG_FONT font_%s = { (unsigned char*)fontBits_%s, FONT_TYPE_%dBPP, %d, %d, %d, %d, fontWidths_%s, NULL, 0 };\n",
           fontName,
           fontName,
           bitsPerPixel,
@@ -287,9 +409,9 @@ static UG_FONT *convertFont(const char *font, int dpi, float fontSize,int bitsPe
     exit(1);
   }
 
-  int i, j,i_idx,j_idx;
+  int i, j,i_idx,j_idx, h;
   int coverage;
-  int ch;
+  UG_Unicode ch;
   int maxWidth = 0;
   int maxHeight = 0;
   int maxAscent = 0;
@@ -301,11 +423,12 @@ static UG_FONT *convertFont(const char *font, int dpi, float fontSize,int bitsPe
  * First found out how big character bitmap is needed. Every character
  * must fit into it so that we can obtain correct character positioning.
  */
-  for (ch = minChar; ch <= maxChar; ch++) {
 
+ for (i = 0; i < codes_count; i++) {
     int ascent;
     int descent;
 
+    ch = codes[i];
     error = FT_Load_Char(face, ch, FT_LOAD_RENDER | FT_LOAD_TARGET_MONO);
     if (error) {
 
@@ -346,8 +469,8 @@ static UG_FONT *convertFont(const char *font, int dpi, float fontSize,int bitsPe
 
   bytesPerChar = bytesPerRow * maxHeight;
 
-  newFont.p = malloc(bytesPerChar * (maxChar - minChar + 1));
-  memset(newFont.p, '\0', bytesPerChar * (maxChar - minChar + 1));
+  newFont.p = malloc(bytesPerChar * codes_count);
+  memset(newFont.p, '\0', bytesPerChar * codes_count);
 
   switch(bitsPerPixel)
   {
@@ -357,15 +480,15 @@ static UG_FONT *convertFont(const char *font, int dpi, float fontSize,int bitsPe
 
   newFont.char_width  = maxWidth;
   newFont.char_height = maxHeight;
-  newFont.start_char  = minChar;
-  newFont.end_char    = maxChar;
-  newFont.widths      = malloc(maxChar - minChar + 1);
+  newFont.start_char  = codes[0];
+  newFont.end_char    = codes[codes_count - 1];
+  newFont.widths      = malloc(codes_count);
 
 /*
  * Render each character.
  */
-  for (ch = minChar; ch <= maxChar; ch++) {
-
+ for (h = 0; h < codes_count; h++) {
+    ch = codes[h];
     error = FT_Load_Char(face, ch, FT_LOAD_RENDER | FT_LOAD_TARGET_MONO);
     if (error) {
 
@@ -416,7 +539,7 @@ static UG_FONT *convertFont(const char *font, int dpi, float fontSize,int bitsPe
 
 
                 if (coverage !=0)
-                    newFont.p[((ch - minChar) * bytesPerChar) + ind] |= (1 << ((xpos % 8)));
+                    newFont.p[(h * bytesPerChar) + ind] |= (1 << ((xpos % 8)));
             }break;
 
             case 8:
@@ -424,7 +547,7 @@ static UG_FONT *convertFont(const char *font, int dpi, float fontSize,int bitsPe
                 ind = ypos * bytesPerRow;
                 ind += xpos ;
 
-                newFont.p[((ch - minChar) * bytesPerChar) + ind  ] = (255 * coverage)/256; // need to be 0..255 range
+                newFont.p[(h * bytesPerChar) + ind  ] = (255 * coverage)/256; // need to be 0..255 range
 
             }break;
         }
@@ -433,11 +556,140 @@ static UG_FONT *convertFont(const char *font, int dpi, float fontSize,int bitsPe
     /*
      * Save character width, freetype uses 1/64 as units for it.
      */
-    newFont.widths[ch - minChar] = (face->glyph->advance.x >> 6) / bpp_mul;
+    newFont.widths[h] = (face->glyph->advance.x >> 6) / bpp_mul;
 
   }
 
+  newFont.codes = codes;
+  newFont.codes_count = codes_count;
   return &newFont;
+}
+
+static int UnicodeCompare(const void *a, const void *b)
+{
+   const UG_Unicode *v1, *v2;
+
+   v1 = (const UG_Unicode *)a;
+   v2 = (const UG_Unicode *)b;
+
+   if (*v1 > *v2)
+      return 1;
+   else if (*v1 < *v2)
+      return -1;
+   else
+      return 0;
+}
+
+int loadCodesFile(const char *codes_file, UG_Unicode **codes, uint32_t *size)
+{
+   UG_U32 i = 0;
+   UG_Unicode code = 0;
+   UG_U8 ch[4];
+   int ret = 0;
+
+   FILE *file = fopen(codes_file, "r");
+   if (!file) {
+      fprintf(stderr, "Failed to open codes file '%s'\n", codes_file);
+      return -1;
+   }
+
+   while(!feof(file)) {
+
+      fread(&ch[0], sizeof(uint8_t), 1, file);
+
+      if (ferror(file)) {
+         perror("fread");
+         ret = -1;
+         goto out;
+      }
+
+
+      if (ch[0] == 0x0a)
+         continue;
+      else if (ch[0] < 0x80)
+         ;
+      else if (ch[0] >= 0xc0 && ch[0] <= 0xdf)
+         fseek(file, 1, SEEK_CUR);
+      else if (ch[0] >= 0xe0 && ch[0] <= 0xef)
+         fseek(file, 2, SEEK_CUR);
+      else if (ch[0] >= 0xf0 && ch[0] <= 0xf7)
+         fseek(file, 3, SEEK_CUR);
+      else {
+         ret = -1;
+         goto out;
+      }
+
+      if (ferror(file)) {
+         fprintf(stderr, "Failed to seek '%s'\n", codes_file);
+         ret = -1;
+         goto out;
+      }
+
+      i++;
+   }
+
+   *size = i;
+
+   rewind(file);
+
+
+   i = 0;
+   *codes = calloc(sizeof(UG_Unicode), *size + 1);
+   while(!feof(file) && i < *size) {
+
+      fread(&ch[0], sizeof(uint8_t), 1, file);
+
+      if (ferror(file)) {
+         ret = -1;
+         free(codes);
+         goto out;
+      }
+
+      if (ch[0] < 0x80)
+         code = ch[0];
+      else if (ch[0] >= 0xc0 && ch[0] <= 0xdf) {
+         fread(ch+1, sizeof(uint8_t), 1, file);
+         if (ferror(file)) {
+            ret = -1;
+            free(codes);
+            goto out;
+         }
+         code = (ch[0] & 0x1f) << 6 | (ch[1] & 0x3f);
+      }
+      else if (ch[0] >= 0xe0 && ch[0] <= 0xef) {
+         fread(ch+1, sizeof(uint8_t), 2, file);
+         if (ferror(file)) {
+            ret = -1;
+            free(codes);
+            goto out;
+         }
+         code = ((ch[0] & 0xf) << 12) | ((ch[1] & 0x3f) << 6) | (ch[2] & 0x3f);
+      }
+      else if (ch[0] >= 0xf0 && ch[0] <= 0xf7) {
+         fread(ch+1, sizeof(uint8_t), 3, file);
+         if (ferror(file)) {
+            ret = -1;
+            free(codes);
+            goto out;
+         }
+         code = ((ch[0] & 0x7) << 18) | ((ch[1] & 0x3f) << 12) | ((ch[2] & 0x3f) << 6) | (ch[3] & 0x3f);
+      }
+      else {
+         free(codes);
+         ret = -1;
+         goto out;
+      }
+
+
+      (*codes)[i++] = code;   
+   }
+
+   qsort(*codes, *size, sizeof(UG_Unicode), UnicodeCompare);
+
+
+out:
+   fclose(file);
+   return ret;
 }
 
 /*
@@ -445,6 +697,15 @@ static UG_FONT *convertFont(const char *font, int dpi, float fontSize,int bitsPe
  */
 static void showFont(const UG_FONT * font, char* text)
 {
+
+#if 1
+  UG_Unicode *unicodes;
+
+  if (utf8_to_unicode((UG_U8*)text, strlen(text), &unicodes) <= 0) {
+	fprintf(stderr, "Invalid utf8 string\n");
+        exit(1);
+  }
+
   UG_Init(&gui, drawPixel, SCREEN_WIDTH, SCREEN_HEIGHT);
 
   UG_FillScreen(C_WHITE);
@@ -452,10 +713,14 @@ static void showFont(const UG_FONT * font, char* text)
   UG_FontSelect(font);
   UG_SetBackcolor(C_WHITE);
   UG_SetForecolor(C_BLACK);
-  UG_PutString(2, 2, text);
+  UG_PutString(2, 2, unicodes);
   UG_DrawPixel(0, SCREEN_HEIGHT - 1, C_WHITE);
 
   UG_Update();
+#else
+  printf("count %u\n", font->codes_count);
+
+#endif
   printf("\n");
 }
 
@@ -468,17 +733,18 @@ static struct option longopts[] = {
   {"show", required_argument, NULL, 'a'},
   {"dump", no_argument, &dump, 1},
   {"dpi", required_argument, NULL, 'd'},
-  {"minchar", required_argument, NULL, 'z'},
-  {"maxchar", required_argument, NULL, 'e'},
+  {"minchar", optional_argument, NULL, 'z'},
+  {"maxchar", optional_argument, NULL, 'e'},
   {"size", required_argument, NULL, 's'},
   {"font", required_argument, NULL, 'f'},
   {"bpp", optional_argument, NULL, 'b'},
+  {"codesFile", optional_argument, NULL, 'c'},
   {NULL, 0, NULL, 0}
 };
 
 static void usage()
 {
-  fprintf(stderr, "ttf2ugui {--show text|--dump} --font=fontfile [--dpi=displaydpi] --size=fontsize [--bpp=bitsperpixel]\n");
+  fprintf(stderr, "ttf2ugui {--show text|--dump} --font=fontfile [--dpi=displaydpi] --size=fontsize [--bpp=bitsperpixel] [--codesFile=codesfile]\n");
   fprintf(stderr, "If --dpi is not given, font size is assumed to be pixels.\n");
   fprintf(stderr, "Bits per pixel must be 1 or 8. Default is 1.\n");
 
@@ -525,6 +791,10 @@ int main(int argc, char **argv)
       maxChar = atoi(optarg);
       break;
 
+    case 'c':
+      codesFile = optarg;
+      break;
+
     case 0:
       break;
 
@@ -543,6 +813,21 @@ int main(int argc, char **argv)
     exit(1);
   }
 
+
+  if (codesFile) {
+    if (loadCodesFile(codesFile, &codes, &codes_count) < 0) {
+      fprintf(stderr, "Failed to load codes file '%s'\n", codesFile);
+      exit(1);
+    }
+  } else {
+    UG_U32 i = 0;
+    codes_count = maxChar - minChar + 1;
+    codes = calloc(codes_count, sizeof(UG_Unicode));
+
+    for (i = minChar; i <= maxChar; i++)
+      codes[i - minChar] = i;
+  }
+
   const UG_FONT *font;
 
   font = convertFont(fontFile, dpi, fontSize,bpp);
@@ -552,4 +837,7 @@ int main(int argc, char **argv)
 
   if (dump)
     dumpFont(font, fontFile, fontSize,bpp);
+
+  if (codes)
+    free(codes); 
 }
