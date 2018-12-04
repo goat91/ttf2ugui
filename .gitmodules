@@ -1,0 +1,4 @@
+[submodule "UGUI"]
+	path = UGUI
+	url = https://github.com/goat91/UGUI.git
+	branch = develop
